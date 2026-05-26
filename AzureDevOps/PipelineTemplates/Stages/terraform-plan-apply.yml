@@ -1,0 +1,316 @@
+# ---------------------------------------------------------------------------
+# Reusable Terraform Plan / Apply Stage Template
+# ---------------------------------------------------------------------------
+# Creates a Terraform plan stage followed by an apply stage.
+#
+# Notes:
+# - envName is used in stage names, so pass a value that is valid in Azure
+#   DevOps stage identifiers, such as dev, test, prod, or prod_eastus.
+# - Apply runs only when the plan contains resource changes.
+# - Apply is a deployment job, so Azure DevOps environment approvals/checks can
+#   be configured on the environment passed in adoEnvironment.
+#
+# Example:
+#
+#   - template: Common/AzureDevOps/PipelineTemplates/Stages/terraform-plan-apply.yml
+#     parameters:
+#       envName: dev
+#       envDisplayName: Development
+#       adoEnvironment: my-app-dev
+#       serviceConnection: sc-my-subscription
+#       workingDirectory: $(System.DefaultWorkingDirectory)/infra/terraform
+#       backendResourceGroupName: rg-tfstate
+#       backendStorageAccountName: sttfstate001
+#       backendContainerName: tfstate
+#       backendKey: my-app/dev.tfstate
+#       planCommandOptions: -input=false -var-file=environments/dev.tfvars
+#
+# Optional hooks:
+#   prePlanSteps, postPlanSteps, preApplySteps, postApplySteps
+# ---------------------------------------------------------------------------
+
+parameters:
+  - name: envName
+    type: string
+
+  - name: envDisplayName
+    type: string
+
+  - name: adoEnvironment
+    type: string
+
+  - name: dependsOnStage
+    type: object
+    default: []
+
+  - name: serviceConnection
+    type: string
+
+  - name: backendServiceConnection
+    type: string
+    default: ''
+
+  - name: backendResourceGroupName
+    type: string
+
+  - name: backendStorageAccountName
+    type: string
+
+  - name: backendContainerName
+    type: string
+
+  - name: backendKey
+    type: string
+
+  - name: workingDirectory
+    type: string
+    default: $(System.DefaultWorkingDirectory)
+
+  - name: checkoutRepository
+    type: string
+    default: self
+
+  - name: terraformVersion
+    type: string
+    default: latest
+
+  - name: terraformTaskProvider
+    type: string
+    default: azurerm
+
+  - name: planStagePrefix
+    type: string
+    default: Plan
+
+  - name: applyStagePrefix
+    type: string
+    default: Apply
+
+  - name: planJobName
+    type: string
+    default: TerraformPlan
+
+  - name: applyDeploymentName
+    type: string
+    default: TerraformApply
+
+  - name: planPool
+    type: object
+    default:
+      vmImage: ubuntu-latest
+
+  - name: applyPool
+    type: object
+    default:
+      vmImage: ubuntu-latest
+
+  - name: runValidate
+    type: boolean
+    default: true
+
+  - name: planCommandOptions
+    type: string
+    default: -input=false
+
+  - name: applyCommandOptions
+    type: string
+    default: -input=false
+
+  - name: planFileName
+    type: string
+    default: tfplan
+
+  - name: planArtifactPrefix
+    type: string
+    default: tfplan
+
+  - name: terraformEnvVars
+    type: object
+    default: {}
+
+  - name: prePlanSteps
+    type: stepList
+    default: []
+
+  - name: postPlanSteps
+    type: stepList
+    default: []
+
+  - name: preApplySteps
+    type: stepList
+    default: []
+
+  - name: postApplySteps
+    type: stepList
+    default: []
+
+stages:
+  - stage: ${{ parameters.planStagePrefix }}_${{ parameters.envName }}
+    displayName: Plan - ${{ parameters.envDisplayName }}
+    dependsOn: ${{ parameters.dependsOnStage }}
+    condition: and(not(failed()), not(canceled()))
+    jobs:
+      - job: ${{ parameters.planJobName }}
+        displayName: Terraform Plan (${{ parameters.envDisplayName }})
+        pool: ${{ parameters.planPool }}
+        steps:
+          - checkout: ${{ parameters.checkoutRepository }}
+
+          - ${{ each step in parameters.prePlanSteps }}:
+            - ${{ step }}
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform ${{ parameters.terraformVersion }}
+            inputs:
+              terraformVersion: ${{ parameters.terraformVersion }}
+
+          - task: TerraformTaskV4@4
+            displayName: Terraform Init
+            inputs:
+              provider: ${{ parameters.terraformTaskProvider }}
+              command: init
+              workingDirectory: ${{ parameters.workingDirectory }}
+              ${{ if ne(parameters.backendServiceConnection, '') }}:
+                backendServiceArm: ${{ parameters.backendServiceConnection }}
+              ${{ if eq(parameters.backendServiceConnection, '') }}:
+                backendServiceArm: ${{ parameters.serviceConnection }}
+              backendAzureRmResourceGroupName: ${{ parameters.backendResourceGroupName }}
+              backendAzureRmStorageAccountName: ${{ parameters.backendStorageAccountName }}
+              backendAzureRmContainerName: ${{ parameters.backendContainerName }}
+              backendAzureRmKey: ${{ parameters.backendKey }}
+            env: ${{ parameters.terraformEnvVars }}
+
+          - ${{ if eq(parameters.runValidate, true) }}:
+            - task: TerraformTaskV4@4
+              displayName: Terraform Validate
+              inputs:
+                provider: ${{ parameters.terraformTaskProvider }}
+                command: validate
+                workingDirectory: ${{ parameters.workingDirectory }}
+              env: ${{ parameters.terraformEnvVars }}
+
+          - task: TerraformTaskV4@4
+            displayName: Terraform Plan
+            inputs:
+              provider: ${{ parameters.terraformTaskProvider }}
+              command: plan
+              workingDirectory: ${{ parameters.workingDirectory }}
+              environmentServiceNameAzureRM: ${{ parameters.serviceConnection }}
+              commandOptions: >-
+                ${{ parameters.planCommandOptions }}
+                -out=${{ parameters.planFileName }}
+            env: ${{ parameters.terraformEnvVars }}
+
+          - pwsh: |
+              $planJson = terraform show -json "${{ parameters.planFileName }}"
+              if ($LASTEXITCODE -ne 0) {
+                throw "terraform show failed for plan file '${{ parameters.planFileName }}'."
+              }
+
+              $plan = ($planJson -join "`n") | ConvertFrom-Json -Depth 100
+              $changeCount = 0
+              $resourceChanges = @()
+
+              if ($null -ne $plan.resource_changes) {
+                $resourceChanges = @($plan.resource_changes)
+              }
+
+              foreach ($resourceChange in $resourceChanges) {
+                if ($null -eq $resourceChange.change -or $null -eq $resourceChange.change.actions) {
+                  continue
+                }
+
+                $actions = @($resourceChange.change.actions)
+                $actionText = $actions -join ','
+
+                if ($actionText -ne 'no-op' -and $actionText -ne 'read') {
+                  $changeCount++
+                }
+              }
+
+              if ($changeCount -gt 0) {
+                Write-Host "$changeCount Terraform resource change(s) detected."
+                Write-Host "##vso[task.setvariable variable=hasChanges;isOutput=true]true"
+              }
+              else {
+                Write-Host "No Terraform resource changes detected. Apply will be skipped."
+                Write-Host "##vso[task.setvariable variable=hasChanges;isOutput=true]false"
+              }
+            name: detectChanges
+            displayName: Detect Terraform Changes
+            workingDirectory: ${{ parameters.workingDirectory }}
+            env: ${{ parameters.terraformEnvVars }}
+
+          - ${{ each step in parameters.postPlanSteps }}:
+            - ${{ step }}
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Terraform Plan
+            inputs:
+              targetPath: ${{ parameters.workingDirectory }}/${{ parameters.planFileName }}
+              artifact: ${{ parameters.planArtifactPrefix }}-${{ parameters.envName }}
+              publishLocation: pipeline
+
+  - stage: ${{ parameters.applyStagePrefix }}_${{ parameters.envName }}
+    displayName: Apply - ${{ parameters.envDisplayName }}
+    dependsOn: ${{ parameters.planStagePrefix }}_${{ parameters.envName }}
+    condition: |
+      and(
+        succeeded(),
+        eq(dependencies.${{ parameters.planStagePrefix }}_${{ parameters.envName }}.outputs['${{ parameters.planJobName }}.detectChanges.hasChanges'], 'true')
+      )
+    jobs:
+      - deployment: ${{ parameters.applyDeploymentName }}
+        displayName: Terraform Apply (${{ parameters.envDisplayName }})
+        environment: ${{ parameters.adoEnvironment }}
+        pool: ${{ parameters.applyPool }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: ${{ parameters.checkoutRepository }}
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: Download Terraform Plan
+                  inputs:
+                    artifact: ${{ parameters.planArtifactPrefix }}-${{ parameters.envName }}
+                    targetPath: ${{ parameters.workingDirectory }}
+
+                - ${{ each step in parameters.preApplySteps }}:
+                  - ${{ step }}
+
+                - task: TerraformInstaller@1
+                  displayName: Install Terraform ${{ parameters.terraformVersion }}
+                  inputs:
+                    terraformVersion: ${{ parameters.terraformVersion }}
+
+                - task: TerraformTaskV4@4
+                  displayName: Terraform Init
+                  inputs:
+                    provider: ${{ parameters.terraformTaskProvider }}
+                    command: init
+                    workingDirectory: ${{ parameters.workingDirectory }}
+                    ${{ if ne(parameters.backendServiceConnection, '') }}:
+                      backendServiceArm: ${{ parameters.backendServiceConnection }}
+                    ${{ if eq(parameters.backendServiceConnection, '') }}:
+                      backendServiceArm: ${{ parameters.serviceConnection }}
+                    backendAzureRmResourceGroupName: ${{ parameters.backendResourceGroupName }}
+                    backendAzureRmStorageAccountName: ${{ parameters.backendStorageAccountName }}
+                    backendAzureRmContainerName: ${{ parameters.backendContainerName }}
+                    backendAzureRmKey: ${{ parameters.backendKey }}
+                  env: ${{ parameters.terraformEnvVars }}
+
+                - task: TerraformTaskV4@4
+                  displayName: Terraform Apply
+                  inputs:
+                    provider: ${{ parameters.terraformTaskProvider }}
+                    command: apply
+                    workingDirectory: ${{ parameters.workingDirectory }}
+                    environmentServiceNameAzureRM: ${{ parameters.serviceConnection }}
+                    commandOptions: >-
+                      ${{ parameters.applyCommandOptions }}
+                      ${{ parameters.planFileName }}
+                  env: ${{ parameters.terraformEnvVars }}
+
+                - ${{ each step in parameters.postApplySteps }}:
+                  - ${{ step }}
