@@ -1,0 +1,179 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Steps Template : dotnet-build-publish.yml
+#
+# Purpose  : Restore, build, publish, and upload a .NET application artifact.
+#            Supports both web-app (zip via PublishPipelineArtifact) and Azure
+#            Function (zip + AzureFunctionApp deploy) deployment patterns.
+#
+# Usage (inside a job's steps):
+#
+#   steps:
+#     - template: Templates/Steps/dotnet-build-publish.yml@<resource>
+#       parameters:
+#         dotnetVersion:        '10.x'
+#         buildConfiguration:   $(envFullName)   # Debug | Development | Test | Production
+#         artifactName:         'netdrop'
+#         vstsFeed:             'PGRMAP'         # optional
+#         publishWebProjects:   true              # false for Function Apps
+#         zipAfterPublish:      true
+#         # For Azure Function App deployment (optional):
+#         deployFunctionApp:    false
+#         serviceConnection:    $(ADO_SERVICE_CONNECTION_NAME)
+#         functionAppName:      $(APPLICATION_NAME)
+# ──────────────────────────────────────────────────────────────────────────────
+
+parameters:
+  - name: dotnetVersion
+    type: string
+    default: '10.x'
+
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+  - name: artifactName
+    type: string
+    default: 'netdrop'
+
+  # Set to a non-empty string to enable NuGet authenticated feed restore
+  - name: vstsFeed
+    type: string
+    default: ''
+
+  # true  → dotnet publish --output $(Build.ArtifactStagingDirectory) / publishWebProjects
+  # false → dotnet publish --output publish_output (Function App pattern)
+  - name: publishWebProjects
+    type: boolean
+    default: true
+
+  - name: zipAfterPublish
+    type: boolean
+    default: true
+
+  # ── Azure Function App deployment (optional) ─────────────────────────────────
+  - name: deployFunctionApp
+    type: boolean
+    default: false
+
+  - name: serviceConnection
+    type: string
+    default: ''
+
+  - name: functionAppName
+    type: string
+    default: ''
+
+  - name: appResourceGroup
+    type: string
+    default: ''
+
+  - name: appSettingsJson
+    type: string
+    default: ''
+
+steps:
+  # ── SDK ─────────────────────────────────────────────────────────────────────
+  - task: UseDotNet@2
+    displayName: 'Use .NET SDK ${{ parameters.dotnetVersion }}'
+    inputs:
+      version: ${{ parameters.dotnetVersion }}
+
+  # ── NuGet authentication + restore (conditional) ─────────────────────────────
+  - ${{ if ne(parameters.vstsFeed, '') }}:
+    - task: NuGetAuthenticate@1
+      displayName: 'NuGet Authenticate'
+      inputs:
+        vstsFeed: '${{ parameters.vstsFeed }}'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore (authenticated feed)'
+      inputs:
+        command: restore
+        projects: '**/*.csproj'
+        feedsToUse: select
+        vstsFeed: '${{ parameters.vstsFeed }}'
+        includeNuGetOrg: true
+
+  - ${{ if eq(parameters.vstsFeed, '') }}:
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore'
+      inputs:
+        command: restore
+        projects: '**/*.csproj'
+
+  # ── Build ────────────────────────────────────────────────────────────────────
+  - task: DotNetCoreCLI@2
+    displayName: 'Build'
+    inputs:
+      command: build
+      projects: '**/*.csproj'
+      arguments: '--configuration ${{ parameters.buildConfiguration }}'
+
+  # ── Publish – web app pattern ────────────────────────────────────────────────
+  - ${{ if eq(parameters.publishWebProjects, true) }}:
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish Build'
+      inputs:
+        command: publish
+        publishWebProjects: true
+        arguments: '--configuration ${{ parameters.buildConfiguration }} --output $(Build.ArtifactStagingDirectory)'
+        zipAfterPublish: ${{ parameters.zipAfterPublish }}
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Pipeline Artifact (${{ parameters.artifactName }})'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifact: ${{ parameters.artifactName }}
+
+  # ── Publish – Function App pattern ──────────────────────────────────────────
+  - ${{ if eq(parameters.publishWebProjects, false) }}:
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish'
+      inputs:
+        command: publish
+        arguments: '--configuration ${{ parameters.buildConfiguration }} --output publish_output'
+        projects: '**/*.csproj'
+        publishWebProjects: false
+        modifyOutputPath: false
+        zipAfterPublish: false
+
+    - bash: |
+        sudo apt-get update
+        sudo apt-get install -y zip
+      displayName: 'Install zip'
+
+    - task: ArchiveFiles@2
+      displayName: 'Archive files'
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)/publish_output'
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: '$(Build.ArtifactStagingDirectory)/build$(Build.BuildId).zip'
+        replaceExistingArchive: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Build Artifact (${{ parameters.artifactName }})'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/build$(Build.BuildId).zip'
+        artifactName: ${{ parameters.artifactName }}
+        publishLocation: Container
+
+    # Optional: deploy directly to Azure Function App
+    - ${{ if eq(parameters.deployFunctionApp, true) }}:
+      - task: AzureFunctionApp@2
+        displayName: 'Deploy Azure Function App'
+        inputs:
+          azureSubscription: '${{ parameters.serviceConnection }}'
+          appType: functionApp
+          appName: '${{ parameters.functionAppName }}'
+          package: '$(Build.ArtifactStagingDirectory)/build$(Build.BuildId).zip'
+          deploymentMethod: runFromPackage
+
+      - ${{ if ne(parameters.appSettingsJson, '') }}:
+        - task: AzureAppServiceSettings@1
+          displayName: 'Set Application Settings'
+          inputs:
+            azureSubscription: '${{ parameters.serviceConnection }}'
+            appName: '${{ parameters.functionAppName }}'
+            resourceGroupName: '${{ parameters.appResourceGroup }}'
+            appSettings: '${{ parameters.appSettingsJson }}'
