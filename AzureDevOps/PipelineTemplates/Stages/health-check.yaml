@@ -1,0 +1,38 @@
+parameters:
+  - name: deployRepo
+    type: string
+    default: 'Enterprise Components/IT.Shared.Deploy'
+  - name: URI
+    type: string
+  - name: Method
+    type: string
+    default: 'GET'
+  - name: SuccessTextContent
+    type: string
+    default: 'Healthy'
+  - name: Retries
+    type: number
+    default: 5
+  - name: SecondsDelay
+    type: number
+    default: 2
+  - name: TimeoutSec
+    type: number
+    default: 120
+
+steps:
+  - checkout: 'git://${{ parameters.deployRepo }}'
+    path: deployRepo
+  - task: PowerShell@2
+    displayName: '${{ parameters.Method }} ${{ parameters.URI }}...'    
+    inputs:
+      failOnStderr: true
+      targetType: 'filePath'
+      filePath: $(Agent.BuildDirectory)/deployRepo/Common/AzureDevOps/PipelineScripts/Helpers/HealthCheckHttpRequestWithRetry.ps1
+      arguments: > # Use this to avoid newline characters in multi-line string
+        -URI "${{ parameters.URI }}"
+        -Method "${{ parameters.Method }}"
+        -SuccessTextContent "${{ parameters.SuccessTextContent }}"
+        -Retries ${{ parameters.Retries }}
+        -SecondsDelay ${{ parameters.SecondsDelay }}
+        -TimeoutSec ${{ parameters.TimeoutSec }}
