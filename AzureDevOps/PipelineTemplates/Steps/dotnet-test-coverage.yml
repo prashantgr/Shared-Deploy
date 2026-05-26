@@ -1,0 +1,109 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Steps Template : dotnet-test-coverage.yml
+#
+# Purpose  : Restore NuGet packages, run unit tests with XPlat Code Coverage,
+#            publish coverage results, and enforce a minimum line-coverage
+#            threshold.
+#
+# Usage (inside a job's steps):
+#
+#   steps:
+#     - template: Templates/Steps/dotnet-test-coverage.yml@<resource>
+#       parameters:
+#         dotnetVersion:      '10.x'          # optional – defaults to 8.x
+#         testProjects:       '**/*Tests/*.csproj'
+#         buildConfiguration: 'Debug'        # optional – defaults to Debug
+#         coverageThreshold:  80             # optional – defaults to 80
+#         vstsFeed:           'Midmark'      # optional – leave empty to skip NuGet auth
+# ──────────────────────────────────────────────────────────────────────────────
+
+parameters:
+  - name: dotnetVersion
+    type: string
+    default: '10.x'
+
+  - name: testProjects
+    type: string
+    default: '**/*Tests/*.csproj'
+
+  - name: buildConfiguration
+    type: string
+    default: 'Debug'
+
+  - name: coverageThreshold
+    type: number
+    default: 80
+
+  # Set to a non-empty string to enable NuGet authenticated feed restore
+  - name: vstsFeed
+    type: string
+    default: ''
+
+steps:
+  # ── SDK ─────────────────────────────────────────────────────────────────────
+  - task: UseDotNet@2
+    displayName: 'Use .NET SDK ${{ parameters.dotnetVersion }}'
+    inputs:
+      version: ${{ parameters.dotnetVersion }}
+
+  # ── Report generator (required for coverage merge) ──────────────────────────
+  - script: dotnet tool install --global dotnet-reportgenerator-globaltool
+    displayName: 'Install ReportGenerator tool'
+
+  # ── NuGet authentication (conditional) ──────────────────────────────────────
+  - ${{ if ne(parameters.vstsFeed, '') }}:
+    - task: NuGetAuthenticate@1
+      displayName: 'NuGet Authenticate'
+      inputs:
+        vstsFeed: '${{ parameters.vstsFeed }}'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore (authenticated feed)'
+      inputs:
+        command: restore
+        projects: '**/*.csproj'
+        feedsToUse: select
+        vstsFeed: '${{ parameters.vstsFeed }}'
+        includeNuGetOrg: true
+
+  - ${{ if eq(parameters.vstsFeed, '') }}:
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore'
+      inputs:
+        command: restore
+        projects: '**/*.csproj'
+
+  # ── Test + collect coverage ──────────────────────────────────────────────────
+  - task: DotNetCoreCLI@2
+    displayName: 'Run tests and collect code coverage'
+    inputs:
+      command: test
+      projects: '${{ parameters.testProjects }}'
+      arguments: >-
+        --configuration ${{ parameters.buildConfiguration }}
+        --collect:"XPlat Code Coverage"
+        -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+      publishTestResults: true
+
+  # ── Publish coverage to Azure DevOps ────────────────────────────────────────
+  - task: PublishCodeCoverageResults@2
+    displayName: 'Publish Code Coverage Results'
+    inputs:
+      summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+      failIfCoverageEmpty: true
+
+  # ── Enforce minimum threshold ────────────────────────────────────────────────
+  - task: PowerShell@2
+    displayName: 'Check Code Coverage Threshold (${{ parameters.coverageThreshold }}%)'
+    inputs:
+      targetType: inline
+      script: |
+        $file = Get-ChildItem -Path "$(Agent.TempDirectory)" -Filter "coverage.cobertura.xml" -Recurse -ErrorAction Stop | Select-Object -First 1
+        if (-not $file) { Write-Error "coverage.cobertura.xml not found"; exit 1 }
+        $coverageXml        = [xml](Get-Content $file.FullName)
+        $coveragePercentage = [decimal]($coverageXml.coverage.'line-rate') * 100
+        Write-Host "Coverage: $coveragePercentage%"
+        if ($coveragePercentage -lt [int]${{ parameters.coverageThreshold }}) {
+            Write-Error "Code coverage $coveragePercentage% is below the threshold of ${{ parameters.coverageThreshold }}%"
+            exit 1
+        }
