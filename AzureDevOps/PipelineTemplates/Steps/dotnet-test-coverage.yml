@@ -14,7 +14,7 @@
 #         testProjects:       '**/*Tests/*.csproj'
 #         buildConfiguration: 'Debug'        # optional – defaults to Debug
 #         coverageThreshold:  80             # optional – defaults to 80
-#         vstsFeed:           'Midmark'      # optional – leave empty to skip NuGet auth
+#         vstsFeed:           'PRGAP'      # optional – leave empty to skip NuGet auth
 # ──────────────────────────────────────────────────────────────────────────────
 
 parameters:
