@@ -1,0 +1,316 @@
+# ---------------------------------------------------------------------------
+# Reusable .NET Azure Function App Blue-Green Deploy Stage Template
+# ---------------------------------------------------------------------------
+# Builds and deploys a .NET Azure Function App using a blue-green deployment
+# strategy via slot swapping.
+#
+# When isBlueGreenSlotDeploy is true:
+#   1. Build       - Compiles, publishes, and packages the .NET Function App as a zip artifact.
+#   2. DeploySlot  - Deploys the artifact to the staging (or named) slot.
+#   3. HealthCheck - Polls the slot health endpoint until it reports healthy.
+#   4. Swap        - Swaps the slot into production after a successful health check.
+#
+# When isBlueGreenSlotDeploy is false:
+#   A standard deploy directly to the production slot is performed instead.
+#
+# Example:
+#
+#   variables:
+#     isBlueGreenSlotDeploy: true
+#
+#   stages:
+#     - template: Common/AzureDevOps/PipelineTemplates/Stages/blue-green-azure-function-deploy.yml
+#       parameters:
+#         envName: dev
+#         envDisplayName: Development
+#         adoEnvironment: my-function-dev
+#         dependsOnStage: []
+#         serviceConnection: $(SERVICE_CONNECTION)
+#         appName: func-my-worker-dev
+#         resourceGroupName: rg-my-worker-dev
+#         projectPath: src/My.Functions/My.Functions.csproj
+#         dotnetVersion: 8.x
+#         buildConfiguration: Release
+#         slotName: staging
+#         slotHealthCheckUri: https://func-my-worker-dev-staging.azurewebsites.net/api/health
+# ---------------------------------------------------------------------------
+
+parameters:
+  - name: envName
+    type: string
+
+  - name: envDisplayName
+    type: string
+
+  - name: adoEnvironment
+    type: string
+
+  - name: dependsOnStage
+    type: string
+
+  - name: serviceConnection
+    type: string
+
+  - name: appName
+    type: string
+
+  - name: resourceGroupName
+    type: string
+
+  - name: projectPath
+    type: string
+
+  - name: dotnetVersion
+    type: string
+    default: 8.x
+
+  - name: buildConfiguration
+    type: string
+    default: Release
+
+  - name: appType
+    type: string
+    default: functionAppLinux
+    values:
+      - functionApp
+      - functionAppLinux
+
+  - name: slotName
+    type: string
+    default: staging
+
+  - name: slotHealthCheckUri
+    type: string
+
+  - name: healthCheckSuccessText
+    type: string
+    default: Healthy|Up
+
+  - name: healthCheckRetries
+    type: number
+    default: 5
+
+  - name: healthCheckDelaySeconds
+    type: number
+    default: 10
+
+  - name: healthCheckTimeoutSeconds
+    type: number
+    default: 120
+
+  - name: artifactName
+    type: string
+    default: drop
+
+  - name: packageFileName
+    type: string
+    default: function.zip
+
+stages:
+  - stage: Build_${{ parameters.envName }}
+    displayName: Build - ${{ parameters.envDisplayName }}
+    dependsOn: ${{ parameters.dependsOnStage }}
+    condition: succeeded()
+    jobs:
+      - job: BuildFunctionApp
+        displayName: Build Function App package
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            displayName: Use .NET SDK ${{ parameters.dotnetVersion }}
+            inputs:
+              packageType: sdk
+              version: ${{ parameters.dotnetVersion }}
+
+          - task: NuGetAuthenticate@1
+            displayName: Authenticate NuGet feeds
+
+          - task: DotNetCoreCLI@2
+            displayName: Restore
+            inputs:
+              command: restore
+              projects: ${{ parameters.projectPath }}
+              feedsToUse: config
+              nugetConfigPath: nuget.config
+
+          - task: DotNetCoreCLI@2
+            displayName: Build
+            inputs:
+              command: build
+              projects: ${{ parameters.projectPath }}
+              arguments: --configuration ${{ parameters.buildConfiguration }} --no-restore
+
+          - task: DotNetCoreCLI@2
+            displayName: Publish
+            inputs:
+              command: publish
+              publishWebProjects: false
+              projects: ${{ parameters.projectPath }}
+              arguments: --configuration ${{ parameters.buildConfiguration }} --no-build --output $(Build.ArtifactStagingDirectory)/function
+              zipAfterPublish: false
+              modifyOutputPath: false
+
+          - task: PowerShell@2
+            displayName: Prepare Function package directory
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)/function-package"
+
+          - task: ArchiveFiles@2
+            displayName: Archive Function App package
+            inputs:
+              rootFolderOrFile: $(Build.ArtifactStagingDirectory)/function
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/function-package/${{ parameters.packageFileName }}
+              replaceExistingArchive: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish build artifact (${{ parameters.artifactName }})
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/function-package
+              artifact: ${{ parameters.artifactName }}
+              publishLocation: pipeline
+
+  # Default deploy path used when blue/green slot deployment is not configured.
+  - stage: AzureStandardDeploy_${{ parameters.envName }}
+    displayName: Standard Deploy - ${{ parameters.envDisplayName }}
+    dependsOn: Build_${{ parameters.envName }}
+    condition: and(succeeded(), eq(variables.isBlueGreenSlotDeploy, false))
+    jobs:
+      - deployment: StandardDeploy
+        displayName: Deploy Function App
+        environment: ${{ parameters.adoEnvironment }}
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  displayName: Download build artifact (${{ parameters.artifactName }})
+                  inputs:
+                    artifact: ${{ parameters.artifactName }}
+                    targetPath: $(Pipeline.Workspace)/${{ parameters.artifactName }}
+
+                - task: AzureFunctionApp@2
+                  displayName: Deploy Function App to production
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    appType: ${{ parameters.appType }}
+                    appName: ${{ parameters.appName }}
+                    package: $(Pipeline.Workspace)/${{ parameters.artifactName }}/${{ parameters.packageFileName }}
+                    deploymentMethod: zipDeploy
+
+  - stage: DeploySlot_${{ parameters.envName }}
+    displayName: Deploy Slot - ${{ parameters.envDisplayName }}
+    dependsOn: Build_${{ parameters.envName }}
+    condition: and(succeeded(), eq(variables.isBlueGreenSlotDeploy, true))
+    jobs:
+      - job: DeployStagingSlot
+        displayName: Deploy to ${{ parameters.slotName }} slot
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: Download build artifact (${{ parameters.artifactName }})
+            inputs:
+              artifact: ${{ parameters.artifactName }}
+              targetPath: $(Pipeline.Workspace)/${{ parameters.artifactName }}
+
+          - task: AzureFunctionApp@2
+            displayName: Deploy Function App to ${{ parameters.slotName }} slot
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              appType: ${{ parameters.appType }}
+              appName: ${{ parameters.appName }}
+              deployToSlotOrASE: true
+              resourceGroupName: ${{ parameters.resourceGroupName }}
+              slotName: ${{ parameters.slotName }}
+              package: $(Pipeline.Workspace)/${{ parameters.artifactName }}/${{ parameters.packageFileName }}
+              deploymentMethod: zipDeploy
+
+  - stage: HealthCheck_${{ parameters.envName }}
+    displayName: Health Check Slot - ${{ parameters.envDisplayName }}
+    dependsOn: DeploySlot_${{ parameters.envName }}
+    condition: and(succeeded(), eq(variables.isBlueGreenSlotDeploy, true))
+    jobs:
+      - job: HealthCheck
+        displayName: Verify ${{ parameters.slotName }} slot
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - bash: |
+              set -euo pipefail
+
+              uri='${{ parameters.slotHealthCheckUri }}'
+              success_text='${{ parameters.healthCheckSuccessText }}'
+              retries=${{ parameters.healthCheckRetries }}
+              delay_seconds=${{ parameters.healthCheckDelaySeconds }}
+              timeout_seconds=${{ parameters.healthCheckTimeoutSeconds }}
+
+              echo "Using health check endpoint $uri."
+
+              for attempt in $(seq 1 "$retries"); do
+                response_file="$(mktemp)"
+                status_code="$(curl --silent --show-error --location --max-time "$timeout_seconds" --output "$response_file" --write-out "%{http_code}" "$uri" || true)"
+                response_body="$(cat "$response_file")"
+                rm -f "$response_file"
+
+                body_matches_success=false
+                IFS='|' read -r -a expected_success_texts <<< "$success_text"
+                for expected_success_text in "${expected_success_texts[@]}"; do
+                  if [[ -n "$expected_success_text" && "$response_body" == *"$expected_success_text"* ]]; then
+                    body_matches_success=true
+                    break
+                  fi
+                done
+
+                if [[ "$status_code" =~ ^2[0-9][0-9]$ ]] && [[ "$body_matches_success" == true ]]; then
+                  echo "Health check passed on attempt $attempt."
+                  exit 0
+                fi
+
+                echo "Health check attempt $attempt/$retries failed with HTTP $status_code; expected response body to contain one of: $success_text."
+                if [ "$attempt" -lt "$retries" ]; then
+                  sleep "$delay_seconds"
+                fi
+              done
+
+              echo "Health check failed for $uri."
+              exit 1
+            displayName: Call health endpoint
+
+  - stage: Swap_${{ parameters.envName }}
+    displayName: Swap Slot - ${{ parameters.envDisplayName }}
+    dependsOn: HealthCheck_${{ parameters.envName }}
+    condition: and(succeeded(), eq(variables.isBlueGreenSlotDeploy, true))
+    jobs:
+      - deployment: SwapToProduction
+        displayName: Swap ${{ parameters.slotName }} to production
+        environment: ${{ parameters.adoEnvironment }}
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Swap ${{ parameters.slotName }} slot
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      az functionapp deployment slot swap \
+                        --resource-group '${{ parameters.resourceGroupName }}' \
+                        --name '${{ parameters.appName }}' \
+                        --slot '${{ parameters.slotName }}' \
+                        --target-slot production
