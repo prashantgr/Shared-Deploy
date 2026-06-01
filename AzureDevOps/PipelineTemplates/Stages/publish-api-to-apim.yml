@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------------
+# Reusable Publish API to APIM Steps Template
+# ---------------------------------------------------------------------------
+# Tokenizes swagger files, then imports supported OpenAPI JSON files found under
+# pathToSwaggerDoc into Azure API Management.
+#
+# Include this template inside a job's `steps:` block. Although this file lives
+# under PipelineTemplates/Stages, it defines `steps`, not `stages`.
+#
+# Example usage in azure-pipelines.yml:
+#
+#   resources:
+#     repositories:
+#       - repository: sharedDeploy
+#         type: git
+#         name: <ProjectName>/IT.Shared.Deploy
+#         ref: refs/heads/main
+#
+#   stages:
+#     - stage: PublishApiToApim
+#       displayName: Publish API to APIM
+#       jobs:
+#         - job: PublishApi
+#           displayName: Publish swagger
+#           pool:
+#             vmImage: windows-latest
+#           steps:
+#             - checkout: self
+#             - checkout: sharedDeploy
+#               path: s/IT.Shared.Deploy
+#
+#             - template: Common/AzureDevOps/PipelineTemplates/Stages/publish-api-to-apim.yml@sharedDeploy
+#               parameters:
+#                 infrastructureDeployRepoPath: $(Pipeline.Workspace)/s/IT.Shared.Deploy
+#                 apiManagementApiName: my-api
+#                 apiManagementPath: my-api
+#                 apiManagementApiPolicyString: '<policies><inbound><base /></inbound><backend><base /></backend><outbound><base /></outbound><on-error><base /></on-error></policies>'
+#                 apiManagementInstanceName: $(API_MANAGEMENT_INSTANCE_NAME)
+#                 apiManagementResourceGroupName: $(API_MANAGEMENT_RESOURCE_GROUP_NAME)
+#                 azureAdConfigClientId: $(AZURE_AD_CONFIG_CLIENTID)
+#                 backendServiceUrl: https://my-api-$(envShortName).azurewebsites.net
+#                 enterpriseApimSubscription: $(AZURE_SERVICE_CONNECTION)
+#                 pathToSwaggerDoc: $(Pipeline.Workspace)/s/$(Build.Repository.Name)/swagger
+#
+# Notes:
+# - infrastructureDeployRepoPath must contain Deployment/tokenizer.ps1 and
+#   Apim/publishToApim.ps1 because this template appends those subpaths.
+# - pathToSwaggerDoc is searched recursively for files named `*.swagger.json`,
+#   `swagger.json`, `*.openapi.json`, or `openapi.json`.
+# ---------------------------------------------------------------------------
+
+parameters:
+  - name: infrastructureDeployRepoPath
+    type: string
+    default: '$(Pipeline.Workspace)/s/IT.Shared.Deploy'
+  - name: apiManagementApiName
+    type: string
+  - name: apiManagementPath
+    type: string
+  - name: apiManagementApiPolicyString
+    type: string
+  - name: apiManagementInstanceName
+    type: string
+    default: $(API_MANAGEMENT_INSTANCE_NAME)
+  - name: apiManagementResourceGroupName
+    type: string
+    default: $(API_MANAGEMENT_RESOURCE_GROUP_NAME)
+  - name: azureAdConfigClientId
+    type: string
+    default: -needs-to-be-replaced-
+  - name: backendServiceUrl
+    type: string
+    default: NONE
+  - name: enterpriseApimSubscription
+    type: string
+    default: subscuption-Guid/Azuresubname
+  - name: pathToSwaggerDoc
+    type: string
+
+steps:
+- task: PowerShell@2
+  displayName: Process Tokenized Swagger Files
+  inputs:
+    filePath: ${{ parameters.infrastructureDeployRepoPath }}/Scripts/tokenizer.ps1
+    arguments: '"${{ parameters.pathToSwaggerDoc }}" "AZURE_AD_CONFIG_CLIENTID=${{ parameters.azureAdConfigClientId }}:BACKEND_SERVICE_URL=${{ parameters.backendServiceUrl }}"'
+    pwsh: true
+
+- task: AzurePowerShell@5
+  displayName: 'Azure PowerShell script: Publish swagger files'
+  inputs:
+    azureSubscription: ${{ parameters.enterpriseApimSubscription }}
+    ScriptPath: ${{ parameters.infrastructureDeployRepoPath }}/Scripts/publishToApim.ps1
+    ScriptArguments: >
+      -groupName "${{ parameters.apiManagementResourceGroupName }}"
+      -instanceName "${{ parameters.apiManagementInstanceName }}"
+      -apimPath "${{ parameters.apiManagementPath }}"
+      -apimApiName "${{ parameters.apiManagementApiName }}"
+      -policyString "$env:APIM_POLICY_STRING"
+      -swaggerPath "${{ parameters.pathToSwaggerDoc }}"
+    azurePowerShellVersion: LatestVersion
+    pwsh: true
+  env:
+    APIM_POLICY_STRING: ${{ parameters.apiManagementApiPolicyString }}
